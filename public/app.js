@@ -241,6 +241,82 @@ function toggleQuality() {
   setTimeout(applyPlaybackQuality, 1600);
 }
 
+/* ================= Media Session: state / position / handlers =================
+   The YouTube player lives in a cross-origin iframe, so the host (browser or
+   Android wrapper) cannot see whether it is playing. Reporting playbackState,
+   position and action handlers ourselves is what lets the notification show the
+   right state and lets background playback stay armed. */
+let _msHandlersSet = false;
+let _msEndedTimer = null;
+let _msLastPos = 0;
+
+function msSeekBy(delta) {
+  try {
+    if (!Player.yt || !Player.ready) return;
+    const dur = Player.yt.getDuration() || 0;
+    const t = Math.max(0, (Player.yt.getCurrentTime() || 0) + delta);
+    Player.yt.seekTo(dur ? Math.min(dur, t) : t, true);
+  } catch {}
+}
+
+function setupMediaSessionHandlers() {
+  if (_msHandlersSet || !('mediaSession' in navigator)) return;
+  _msHandlersSet = true;
+  const set = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch {} };
+  set('play', () => { Player.yt && Player.yt.playVideo(); });
+  set('pause', () => { Player.yt && Player.yt.pauseVideo(); });
+  set('stop', () => { Player.yt && Player.yt.pauseVideo(); });
+  set('previoustrack', () => prevTrack());
+  set('nexttrack', () => nextTrack(false));
+  set('seekbackward', (d) => msSeekBy(-((d && d.seekOffset) || 10)));
+  set('seekforward', (d) => msSeekBy((d && d.seekOffset) || 10));
+  set('seekto', (d) => {
+    try {
+      if (d && typeof d.seekTime === 'number' && Player.yt && Player.ready) Player.yt.seekTo(d.seekTime, true);
+    } catch {}
+  });
+}
+
+/* Map YT.PlayerState -> mediaSession.playbackState.
+   UNSTARTED (-1) and CUED (5) are transitional, so they are ignored. ENDED is
+   debounced: the next track normally starts within a moment, and a brief
+   "paused" in between would make a background host stop the page. */
+function syncMediaSessionState(state) {
+  if (!('mediaSession' in navigator)) return;
+  try {
+    clearTimeout(_msEndedTimer);
+    if (state === 1 || state === 3) {
+      navigator.mediaSession.playbackState = 'playing';
+    } else if (state === 2) {
+      navigator.mediaSession.playbackState = 'paused';
+    } else if (state === 0) {
+      _msEndedTimer = setTimeout(() => {
+        try {
+          if (Player.yt && Player.yt.getPlayerState && Player.yt.getPlayerState() === 0) {
+            navigator.mediaSession.playbackState = 'paused';
+          }
+        } catch {}
+      }, 2500);
+    }
+  } catch {}
+}
+
+/* Progress for the notification / lock screen. Throttled to ~1/s. */
+function updateMediaSessionPosition(cur, dur) {
+  if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
+  const now = Date.now();
+  if (now - _msLastPos < 1000) return;
+  _msLastPos = now;
+  try {
+    if (!isFinite(dur) || dur <= 0) return;
+    navigator.mediaSession.setPositionState({
+      duration: dur,
+      position: Math.max(0, Math.min(cur, dur)),
+      playbackRate: Player.speed > 0 ? Player.speed : 1,
+    });
+  } catch {}
+}
+
 window.onYouTubeIframeAPIReady = () => {
   Player.yt = new YT.Player('yt-player', {
     height: '720', width: '720',
@@ -268,6 +344,7 @@ window.onYouTubeIframeAPIReady = () => {
         } catch {}
       },
       onStateChange: (e) => {
+        syncMediaSessionState(e.data);
         if (e.data === YT.PlayerState.ENDED) {
           try {
             const vid = Player.yt.getVideoData && Player.yt.getVideoData().video_id;
@@ -466,10 +543,7 @@ function startCurrent() {
       title: s.title, artist: s.artist || '',
       artwork: s.thumbnail ? [{ src: s.thumbnail, sizes: '544x544' }] : [],
     });
-    navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
-    navigator.mediaSession.setActionHandler('nexttrack', () => nextTrack(false));
-    navigator.mediaSession.setActionHandler('play', () => Player.yt && Player.yt.playVideo());
-    navigator.mediaSession.setActionHandler('pause', () => Player.yt && Player.yt.pauseVideo());
+    setupMediaSessionHandlers();
   }
   loadLyrics(s);
   loadSponsorBlock(s.videoId);
@@ -598,6 +672,7 @@ setInterval(() => {
   }
   const dur = Player.yt.getDuration() || 0;
   const pct = dur ? (cur / dur) * 100 : 0;
+  updateMediaSessionPosition(cur, dur);
   $('#mini-progress-fill').style.width = pct + '%';
   const knob = $('.pb-knob');
   if (knob) knob.style.left = pct + '%';
